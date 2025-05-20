@@ -15,14 +15,9 @@
 #include <errno.h>
 #include <string.h>
 #include <ctype.h>
-#include <assert.h>
 
 #include "defs.h"
-#include "vm.h"
-#include "bios.h"
-#include "bdos.h"
 #include "vt.h"
-#include "disassem.h"
 
 #if defined macintosh
 #	include <Types.h>
@@ -46,72 +41,33 @@
 #	endif
 #endif
 
-#define INTR_CHAR	31	/* control-underscore */
 
-struct vm_s {
-	bdos *bd;
-	bios *bios;
-	int nobdos;
-	int strace;
-	int bdos_return;
+extern int errno;
 
-    /* these are for the I/O, CP/M, and outside needs */
-    boolean trace;		/* trace mode off/on */
-    boolean step;		/* step-trace mode off/on */
-    int sig;		/* caught a signal */
-    int syscall;	/* CP/M syscall to be done */
-    int biosfn;		/* BIOS function be done */
 
-    int have_term;   /* FALSE if terminal initialization failed */
+/* globally visible vars */
+static FILE *logfile = NULL;
+
 
 #ifndef _WIN32
 #  if defined UNIX || defined BeBox
 #    ifdef POSIX_TTY
 #	   define termio termios
 #    endif
-    struct termio rawterm, oldterm;	/* for raw terminal I/O */
+static struct termio rawterm, oldterm;	/* for raw terminal I/O */
 #  endif
 #endif
 
-    FILE *logfile;
-};
-
-extern int errno;
-
-static void dumptrace(vm *obj, z80info *z80);
-
-vm *vm_new()
-{
-	vm *obj;
-	obj = calloc(1, sizeof(vm));
-	obj->bios = bios_new(obj);
-	obj->bd = bdos_new(obj, obj->bios);
-	obj->bdos_return = -1;
-
-	/* initialize the other misc stuff */
-	obj->trace = FALSE;
-	obj->step = FALSE;
-	obj->sig = 0;
-	obj->syscall = FALSE;
-
 #ifdef _WIN32
-	obj->have_term = 0;   /* no terminal in Win32 */
+static int have_term = 0;   /* no terminal in Win32 */
 #else
-	obj->have_term = 1;   /* FALSE if terminal initialization failed */
+static int have_term = 1;   /* FALSE if terminal initialization failed */
 #endif
 
-	return obj;
-}
-
-void vm_destroy(vm *obj)
-{
-	bdos_destroy(obj->bd);
-	bios_destroy(obj->bios);
-	free(obj);
-}
+static void dumptrace(z80info *z80);
 
 
-static char *jgets(char *s, int len, FILE *f)
+char *jgets(char *s, int len, FILE *f)
 {
 	char *rtn = fgets(s, len, f);
 	if (rtn)
@@ -128,13 +84,14 @@ static char *jgets(char *s, int len, FILE *f)
 \*-----------------------------------------------------------------------*/
 
 void
-vm_resetterm(vm *obj)
+resetterm(void)
 {
 #ifndef _WIN32
-    if (obj->have_term)
-		tcsetattr(fileno(stdin), TCSADRAIN, &obj->oldterm);
+    if (have_term)
+		tcsetattr(fileno(stdin), TCSADRAIN, &oldterm);
 #endif
 }
+
 
 
 /*-----------------------------------------------------------------------*\
@@ -142,11 +99,11 @@ vm_resetterm(vm *obj)
 \*-----------------------------------------------------------------------*/
 
 void
-vm_setterm(vm *obj)
+setterm(void)
 {
 #ifndef _WIN32
-    if (obj->have_term)
-		tcsetattr(fileno(stdin), TCSADRAIN, &obj->rawterm);
+    if (have_term)
+		tcsetattr(fileno(stdin), TCSADRAIN, &rawterm);
 #endif
 }
 
@@ -158,27 +115,28 @@ vm_setterm(vm *obj)
 \*-----------------------------------------------------------------------*/
 
 static void
-initterm(vm *obj)
+initterm(void)
 {
 #ifdef _WIN32
 		fprintf(stderr, "Sorry, terminal not found, using cooked mode.\n");
-		obj->have_term = 0;
+		have_term = 0;
 #else
-	if (tcgetattr(fileno(stdin), &obj->oldterm))
+	if (tcgetattr(fileno(stdin), &oldterm))
 	{
 		fprintf(stderr, "Sorry, terminal not found, using cooked mode.\n");
-		obj->have_term = 0;
+		have_term = 0;
 	}
         else {
-	obj->rawterm = obj->oldterm;
-	obj->rawterm.c_iflag &= ~(ICRNL | IXON | IXOFF | INLCR | ICRNL);
-	obj->rawterm.c_lflag &= ~(ICANON | ECHO);
-	obj->rawterm.c_cc[VSUSP] = -1;
-	obj->rawterm.c_cc[VQUIT] = -1;
-	obj->rawterm.c_cc[VERASE] = -1;
-	obj->rawterm.c_cc[VKILL] = -1;
+	rawterm = oldterm;
+	rawterm.c_iflag &= ~(ICRNL | IXON | IXOFF | INLCR | ICRNL);
+	rawterm.c_lflag &= ~(ICANON | ECHO);
+	rawterm.c_cc[VINTR] = -1;
+	rawterm.c_cc[VSUSP] = -1;
+	rawterm.c_cc[VQUIT] = -1;
+	rawterm.c_cc[VERASE] = -1;
+	rawterm.c_cc[VKILL] = -1;
+	tcsetattr(fileno(stdin), TCSADRAIN, &rawterm);
   }
-	/* tcsetattr(fileno(stdin), TCSADRAIN, &rawterm); */
 
 #if 0
 	/* rawterm.c_lflag &= ~(ISIG | ICANON | ECHO); */
@@ -200,22 +158,24 @@ initterm(vm *obj)
 #endif
 }
 
+
+
+
 /*-----------------------------------------------------------------------*\
  |  command  --  called when user-level commands are needed by the z80
  |  for some reason or another
 \*-----------------------------------------------------------------------*/
 
-static void
-command(vm *obj, z80info *z80)
+void
+command(z80info *z80)
 {
 	unsigned int i, j, t, e;
-	int c;
 	char str[256], *s;
 	FILE *fp;
 	static word pe = 0;
 	static word po = 0;
 
-	vm_resetterm(obj);
+	resetterm();
 	printf("\n");
 
 loop:	/* "infinite" loop */
@@ -242,10 +202,10 @@ loop:	/* "infinite" loop */
 		break;
 
 	case 'o':
-		if (obj->logfile != NULL)
+		if (logfile != NULL)
 		{
-			fclose(obj->logfile);
-			obj->logfile = NULL;
+			fclose(logfile);
+			logfile = NULL;
 			printf("    Logging off.\n");
 		}
 		else
@@ -259,9 +219,9 @@ loop:	/* "infinite" loop */
 			if (*s == '\0')
 				break;
 
-			obj->logfile = fopen(s, "w");
+			logfile = fopen(s, "w");
 
-			if (obj->logfile == NULL)
+			if (logfile == NULL)
 				printf("Cannot open logfile!\n");
 			else
 				printf("    Logging on.\n");
@@ -271,13 +231,13 @@ loop:	/* "infinite" loop */
 
 	case '!':				/* fork a shell */
 		system("exec ${SHELL:-/bin/sh}");
-		initterm(obj);
+		initterm();
 		printf("\n");
 		break;
 
 	case 'q':				/* quit */
-		if (obj->logfile != NULL)
-			fclose(obj->logfile);
+		if (logfile != NULL)
+			fclose(logfile);
 
 		exit(0);
 		break;
@@ -287,24 +247,24 @@ loop:	/* "infinite" loop */
 		break;
 
 	case 'b':				/* boot cp/m */
-		vm_setterm(obj);
-		bios_sysreset(obj->bios, z80);
+		setterm();
+		sysreset(z80);
 		return;
 		break;
 
 	case 't':				/* toggle trace mode */
-		obj->trace = !obj->trace;
-		printf("    Trace %s\n", obj->trace ? "on" : "off");
+		z80->trace = !z80->trace;
+		printf("    Trace %s\n", z80->trace ? "on" : "off");
 		break;
 
 	case 's':				/* toggle step-trace mode */
-		obj->step = !obj->step;
-		printf("    Step-trace %s\n", obj->step ? "on" : "off");
-		printf("    Trace %s\n", obj->trace ? "on" : "off");
+		z80->step = !z80->step;
+		printf("    Step-trace %s\n", z80->step ? "on" : "off");
+		printf("    Trace %s\n", z80->trace ? "on" : "off");
 		break;
 
 	case 'd':					/* dump registers */
-		dumptrace(obj, z80);
+		dumptrace(z80);
 		break;
 
 	case 'e':					/* examine memory */
@@ -316,13 +276,11 @@ loop:	/* "infinite" loop */
 
 		for (i = 0; i <= 8; i++)
 		{
-			printf("  %.4X: ", pe);
+			printf("  %.4X:   ", pe);
+
 			for (j = 0; j <= 0xF; j++)
-				printf("%.2X ", z80->mem[pe++]);
-			for (j = 0; j <= 0xF; j++) {
-				c = z80->mem[t + (i << 4) + j];
-				putchar(isprint(c) ? c : '.');
-			}
+				printf("%.2X  ", z80->mem[pe++]);
+
 			printf("\n");
 		}
 
@@ -521,7 +479,7 @@ loop:	/* "infinite" loop */
 		printf("    File-name: ");
 		jgets(str, sizeof(str), stdin);
 
-		if (!vm_loadfile(z80, str))
+		if (!loadfile(z80, str))
 			fprintf(stderr, "Cannot load file %s!\r\n", str);
 
 		break;
@@ -529,7 +487,7 @@ loop:	/* "infinite" loop */
 	case '\0':			/* carriage-return */
 	case '\r':
 	case '\n':
-		if (obj->trace && obj->step)
+		if (z80->trace && z80->step)
 			goto cont;
 
 		break;
@@ -537,9 +495,9 @@ loop:	/* "infinite" loop */
 	case 'c':			/* continue z80 execution */
 	case 'g':
 	cont:
-		vm_setterm(obj);
+		setterm();
 
-		if (obj->trace)
+		if (z80->trace)
 		{
 			z80->event = TRUE;
 			z80->halt = TRUE;
@@ -566,7 +524,7 @@ loop:	/* "infinite" loop */
 \*-----------------------------------------------------------------------*/
 
 static void
-dumptrace(vm *obj, z80info *z80)
+dumptrace(z80info *z80)
 {
 	printf("a%.2X f%.2X bc%.4X de%.4X hl%.4X ",
 			A, F, BC, DE, HL);
@@ -575,14 +533,14 @@ dumptrace(vm *obj, z80info *z80)
 	disassem(z80, PC, stdout);
 	printf("\r\n");
 
-	if (obj->logfile)
+	if (logfile)
 	{
-		fprintf(obj->logfile, "a%.2X f%.2X bc%.4X de%.4X hl%.4X ",
+		fprintf(logfile, "a%.2X f%.2X bc%.4X de%.4X hl%.4X ",
 				A, F, BC, DE, HL);
-		fprintf(obj->logfile, "ix%.4X iy%.4X sp%.4X pc%.4X:%.2X  ",
+		fprintf(logfile, "ix%.4X iy%.4X sp%.4X pc%.4X:%.2X  ",
 				IX, IY, SP, PC, z80->mem[PC]);
-		disassem(z80, PC, obj->logfile);
-		fprintf(obj->logfile, "\r\n");
+		disassem(z80, PC, logfile);
+		fprintf(logfile, "\r\n");
 	}
 }
 
@@ -749,7 +707,7 @@ suffix(char *str, const char *suff)
 
 
 boolean
-vm_loadfile(z80info *z80, const char *fname)
+loadfile(z80info *z80, const char *fname)
 {
 	char buf[200];
 	FILE *fp;
@@ -795,7 +753,7 @@ vm_loadfile(z80info *z80, const char *fname)
    and we must wait for some to occur */
 
 boolean
-vm_input(vm *obj, z80info *z80, byte haddr, byte laddr, byte *val)
+input(z80info *z80, byte haddr, byte laddr, byte *val)
 {
 	unsigned int data;
 
@@ -823,7 +781,7 @@ vm_input(vm *obj, z80info *z80, byte haddr, byte laddr, byte *val)
 			if ((data == '.' && (ev.modifiers & cmdKey)) ||
 					data == INTR_CHAR)
 			{
-				command(obj, z80);
+				command(z80);
 				goto again;
 			}
 			else if (data == 'q' && (ev.modifiers & cmdKey))
@@ -834,7 +792,7 @@ vm_input(vm *obj, z80info *z80, byte haddr, byte laddr, byte *val)
 
 			while (data == INTR_CHAR)
 			{
-				command(obj, z80);
+				command(z80);
 				data = getkey();
 			}
 #else	/* TCGETA */
@@ -845,7 +803,7 @@ vm_input(vm *obj, z80info *z80, byte haddr, byte laddr, byte *val)
 			while ((data > 0x7f && errno == EINTR) ||
 					data == INTR_CHAR)
 			{
-				command(obj, z80);
+				command(z80);
 				data = kget(0);
 				/* data = getchar(); */
 			}
@@ -879,11 +837,11 @@ vm_input(vm *obj, z80info *z80, byte haddr, byte laddr, byte *val)
 
 	/* default - prompt the user for an input byte */
 	default:
-		vm_resetterm(obj);
+		resetterm();
 		printf("INPUT : addr = %X%X    DATA = ", haddr, laddr);
 		fflush(stdout);
 		scanf("%x", &data);
-		vm_setterm(obj);
+		setterm();
 		*val = data;
 		break;
 	}
@@ -897,7 +855,7 @@ vm_input(vm *obj, z80info *z80, byte haddr, byte laddr, byte *val)
 \*-----------------------------------------------------------------------*/
 
 void
-vm_output(vm *obj, z80info *z80, byte haddr, byte laddr, byte data)
+output(z80info *z80, byte haddr, byte laddr, byte data)
 {
 	if (laddr == 0xFF) {
 		/* BIOS call - interrupt the z80 before the next instruction
@@ -905,29 +863,30 @@ vm_output(vm *obj, z80info *z80, byte haddr, byte laddr, byte data)
 		   otherwise we would do it right here */
 		z80->event = TRUE;
 		z80->halt = TRUE;
-		obj->syscall = TRUE;
-		obj->biosfn = data;
+		z80->syscall = TRUE;
+		z80->biosfn = data;
 
-		if (obj->trace)
+		if (z80->trace)
 		{
-			printf("BIOS call %d\r\n", obj->biosfn);
+			printf("BIOS call %d\r\n", z80->biosfn);
 
-			if (obj->logfile)
-				fprintf(obj->logfile, "BIOS call %d\r\n",
-					obj->biosfn);
+			if (logfile)
+				fprintf(logfile, "BIOS call %d\r\n",
+					z80->biosfn);
 		}
 	} else if (laddr == 0) {
 		/* output a character to the screen */
 		/* putchar(data); */
 		vt52(data);
 
-		if (obj->logfile != NULL)
-			putc(data, obj->logfile);
+		if (logfile != NULL)
+			putc(data, logfile);
 	} else {
 		/* dump the data for our user */
 		printf("OUTPUT: addr = %X%X  DATA = %X\r\n", haddr, laddr,data);
 	}
 }
+
 
 
 /*-----------------------------------------------------------------------*\
@@ -936,43 +895,43 @@ vm_output(vm *obj, z80info *z80, byte haddr, byte laddr, byte data)
 \*-----------------------------------------------------------------------*/
 
 void
-vm_haltcpu(vm *obj, z80info *z80)
+haltcpu(z80info *z80)
 {
 	z80->halt = FALSE;
 
 	/* we were interrupted by a Unix signal */
-	if (obj->sig)
+	if (z80->sig)
 	{
-		if (obj->sig != SIGINT)
-			printf("\r\nCaught signal %d.\r\n", obj->sig);
+		if (z80->sig != SIGINT)
+			printf("\r\nCaught signal %d.\r\n", z80->sig);
 
-		obj->sig = 0;
-		command(obj, z80);
+		z80->sig = 0;
+		command(z80);
 		return;
 	}
 
 	/* we are tracing execution of the z80 */
-	if (obj->trace)
+	if (z80->trace)
 	{
 		/* re-enable tracing */
 		z80->event = TRUE;
 		z80->halt = TRUE;
-		dumptrace(obj, z80);
+		dumptrace(z80);
 
-		if (obj->step)
-			command(obj, z80);
+		if (z80->step)
+			command(z80);
 	}
 
 	/* a CP/M syscall - done here so tracing still works */
-	if (obj->syscall)
+	if (z80->syscall)
 	{
-		obj->syscall = FALSE;
-		bios_call(obj->bios, z80, obj->biosfn);
+		z80->syscall = FALSE;
+		bios(z80, z80->biosfn);
 	}
 }
 
 word
-vm_read_mem(vm *obj, z80info *z80, word addr)
+read_mem(z80info *z80, word addr)
 {
 #ifdef MEM_BREAK
 	if (z80->membrk[addr] & M_BREAKPOINT)
@@ -993,15 +952,15 @@ vm_read_mem(vm *obj, z80info *z80, word addr)
 		/* fake some sort of I/O here and return its value */
 	}
 
-	dumptrace(obj, z80);
-	command(obj, z80);
+	dumptrace(z80);
+	command(z80);
 #endif	/* MEM_BREAK */
 
 	return z80->mem[addr];
 }
 
 word
-vm_write_mem(vm *obj, z80info *z80, word addr, byte val)
+write_mem(z80info *z80, word addr, byte val)
 {
 #ifdef MEM_BREAK
 	if (z80->membrk[addr] & M_BREAKPOINT)
@@ -1023,24 +982,22 @@ vm_write_mem(vm *obj, z80info *z80, word addr, byte val)
 		/* then return */
 	}
 
-	dumptrace(obj, z80);
-	command(obj, z80);
+	dumptrace(z80);
+	command(z80);
 #endif	/* MEM_BREAK */
 
 	return z80->mem[addr] = val;
 }
 
 void
-vm_undefinstr(vm *obj, z80info *z80, byte instr)
+undefinstr(z80info *z80, byte instr)
 {
 	printf("\r\nIllegal instruction 0x%.2X at PC=0x%.4X\r\n",
 		instr, PC - 1);
-	command(obj, z80);
+	command(z80);
 }
 
-/* this is needed by interrupt(), quit() and main() */
-static z80info *z80 = NULL;
-static vm *obj = NULL;
+
 
 /*-----------------------------------------------------------------------*\
  |  quit -- terminate this program after cleaning up -- this it is       |
@@ -1051,9 +1008,14 @@ static void
 quit(int sig)
 {
 	printf("\r\nCaught signal %d.\r\n", sig);
-	vm_resetterm(obj);
+	resetterm();
 	exit(2);
 }
+
+
+/* this is needed by both interrupt() and main() */
+static z80info *z80 = NULL;
+
 
 /*-----------------------------------------------------------------------*\
  |  interrupt  --  this is called when we get a usable signal from Unix
@@ -1067,73 +1029,10 @@ interrupt(int s)
 	{
 	    z80->event = TRUE;
 	    z80->halt = TRUE;
-	    obj->sig = s;
+	    z80->sig = s;
 	}
 
 	signal(s, interrupt);
-}
-
-/*-----------------------------------------------------------------------*\
- |  intercept  --  intercept a CPU loop
-\*-----------------------------------------------------------------------*/
-
-static void
-intercept(void *ctx, struct z80info *z80)
-{
-    int i;
-    vm *obj;
-    obj = ctx;
-
-	/* Trace system calls */
-	if (obj->strace && PC == BDOS_HOOK)
-	{
-	        printf("\r\nbdos call %d %s (AF=%04x BC=%04x DE=%04x HL =%04x SP=%04x STACK=", C, bdos_decode(C), AF, BC, DE, HL, SP);
-		for (i = 0; i < 8; ++i)
-		    printf(" %4x", z80->mem[SP + 2*i]
-			   + 256 * z80->mem[SP + 2*i + 1]);
-		printf(")\r\n");
-		obj->bdos_return = SP + 2;
-		if (bdos_fcb(C))
-			bdos_fcb_dump(z80);
-	}
-
-	if (SP == obj->bdos_return)
-	{
-	        printf("\r\nbdos return %d %s (AF=%04x BC=%04x DE=%04x HL =%04x SP=%04x STACK=", C, bdos_decode(C), AF, BC, DE, HL, SP);
-		for (i = 0; i < 8; ++i)
-		    printf(" %4x", z80->mem[SP + 2*i]
-			   + 256 * z80->mem[SP + 2*i + 1]);
-		printf(")\r\n");
-		obj->bdos_return = -1;
-		if (bdos_fcb(C))
-			bdos_fcb_dump(z80);
-	}
-
-	if (!obj->nobdos && PC == BDOS_HOOK)
-	{
-		bdos_check_hook(obj->bd, z80);
-	}
-}
-
-/*-----------------------------------------------------------------------*\
- |  setsigs  --  set up the signal handling
-\*-----------------------------------------------------------------------*/
-
-static void
-setsigs()
-{
-#ifdef SIGQUIT
-	signal(SIGQUIT, quit);
-#endif
-#ifdef SIGHUP
-	signal(SIGHUP, quit);
-#endif
-#ifdef SIGTERM
-	signal(SIGTERM, quit);
-#endif
-#ifdef SIGINT
-	signal(SIGINT, interrupt);
-#endif
 }
 
 /*-----------------------------------------------------------------------*\
@@ -1149,20 +1048,18 @@ main(int argc, const char *argv[])
 
 	cmd[0] = 0;
 
-	obj = vm_new();
-
 	for (x = 1; x < argc; ++x) {
 		if (argv[x][0] == '-' && argv[x][1] == '-') {
 			if (!strcmp(argv[x], "--help")) {
 				help = 1;
 			} else if (!strcmp(argv[x], "--exec")) {
-				bdos_set_exec(obj->bd, 1);
+				exec = 1;
 			} else if (!strcmp(argv[x], "--nobdos")) {
-				obj->nobdos = 1;
+				nobdos = 1;
 			} else if (!strcmp(argv[x], "--trace_bdos")) {
-				bdos_set_trace_bdos(obj->bd, 1);
+				trace_bdos = 1;
 			} else if (!strcmp(argv[x], "--strace")) {
-				obj->strace = 1;
+				strace = 1;
 			} else {
 				fprintf(stderr, "Unknown option %s\n", argv[x]);
 				exit(1);
@@ -1189,44 +1086,34 @@ main(int argc, const char *argv[])
 		exit(0);
 	}
 
-	if (cmd[0])
-		bdos_set_cmd(obj->bd, cmd);
+	if (cmd[0]) {
+		stuff_cmd = cmd;
+	}
 
-	z80 = z80_new();
+	z80 = new_z80info();
 
-	/* Bind the instruction handling interface.
-	 * Function pointers are cast to the type with the generalised instance
-	 * type.
-	 */
-	z80_set_proc(z80, obj,
-			(void (*)(void *, z80info *))vm_haltcpu,
-			(void (*)(void *, z80info *, byte))vm_undefinstr);
+	if (z80 == NULL)
+		return -1;
 
-	/* Bind the I/O interface */
-	z80_set_io(z80, obj,
-			(boolean (*)(void *, z80info *, byte, byte, byte *))vm_input,
-			(void (*)(void *, z80info *, byte, byte, byte))vm_output);
-
-	/* Bind the memory interface */
-	z80_set_mem(z80, obj,
-			(word (*)(void *, z80info *, word))vm_read_mem,
-			(word (*)(void *, z80info *, word, byte))vm_write_mem);
-
-	/* Set up the CPU loop interceptor */
-    z80_set_interceptor(z80, obj, intercept);
-
-    if (!z80) {
-	z80_destroy(z80);
-	vm_destroy(obj);
-	return -1;
-    }
-
-	initterm(obj);
+	initterm();
 
 	/* set up the signals */
-	setsigs();
-	vm_setterm(obj);
-	bios_sysreset(obj->bios, z80);
+#ifdef SIGQUIT
+	signal(SIGQUIT, quit);
+#endif
+#ifdef SIGHUP
+	signal(SIGHUP, quit);
+#endif
+#ifdef SIGTERM
+	signal(SIGTERM, quit);
+#endif
+#ifdef SIGINT
+	signal(SIGINT, interrupt);
+#endif
+
+	setterm();
+
+	sysreset(z80);
 
 	while (1)
 	{
@@ -1234,10 +1121,6 @@ main(int argc, const char *argv[])
 		EventRecord ev;
 		WaitNextEvent(0, &ev, 0, nil);
 #endif
-		z80_run(z80, 100000);
+		z80_emulator(z80, 100000);
 	}
-
-	z80_destroy(z80);
-	vm_destroy(obj);
-	return 0;
 }

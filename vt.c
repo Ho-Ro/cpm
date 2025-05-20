@@ -73,6 +73,7 @@ int kget(int w)
         	for (x = 0; x != stuff_ptr - 1; ++x) {
         		stuff[x] = stuff[x + 1];
         	}
+		stuff_ptr--;
         	stuff[x] = 0;
         	return c;
         }
@@ -147,6 +148,8 @@ int kget(int w)
                 } else if (c == 'F') { /* End */
                         kpush('d');
                         return 'Q' - '@';
+		} else if (c == 'P' || c == 'Q' || c == 'R' || c == 'S') {
+			return INTR_CHAR;
                 } else {
                 	kpush('O');
                 	kpush(c);
@@ -167,7 +170,7 @@ int kget(int w)
 Oc  Ctrl-Rtarw
 */
 
-void putch(int c) {	/* output character without postprocessing */
+void putch(char c) {	/* output character without postprocessing */
     write(fileno(stdout), &c, 1);
 }
 
